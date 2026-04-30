@@ -5,7 +5,7 @@ namespace TypechoPlugin\CommentToMail;
 use \Typecho\Plugin\PluginInterface;
 use \Utils\Helper;
 use \Typecho\{Widget, Db};
-use \Typecho\Widget\Helper\Form\Element\{Password, Text, Radio, Checkbox};
+use \Typecho\Widget\Helper\Form\Element\{Password, Text, Radio, Checkbox, Textarea};
 
 /**
  * 异步评论邮件提醒插件
@@ -85,6 +85,7 @@ class Plugin implements PluginInterface
 			'mode',
 			[
 				'smtp' => 'smtp',
+				'resend' => 'Resend API',
 				'mail' => 'mail()',
 				'sendmail' => 'sendmail()'
 			],
@@ -98,9 +99,9 @@ class Plugin implements PluginInterface
 			NULL,
 			'',
 			_t('SMTP地址'),
-			_t('请填写 SMTP 服务器地址')
+			_t('使用 SMTP 时填写 SMTP 服务器地址。使用 Resend API 时可留空。')
 		);
-		$form->addInput($host->addRule('required', _t('SMTP服务器地址不能为空')));
+		$form->addInput($host);
 
 		$port = new Text(
 			'port',
@@ -110,17 +111,16 @@ class Plugin implements PluginInterface
 			_t('SMTP服务端口, 一般为25. SSL一般为465')
 		);
 		$port->input->setAttribute('class', 'mini');
-		$form->addInput($port->addRule('required', _t('SMTP端口不能为空'))
-			->addRule('isInteger', _t('端口号必须为数字')));
+		$form->addInput($port->addRule('isInteger', _t('端口号必须为数字')));
 
 		$user = new Text(
 			'user',
 			NULL,
 			NULL,
 			_t('SMTP用户'),
-			_t('SMTP服务验证用户名,一般为邮箱账户')
+			_t('SMTP服务验证用户名,一般为邮箱账户。使用 SMTP 时也会作为默认发件邮箱。')
 		);
-		$form->addInput($user->addRule('required', _t('SMTP服务验证用户名不能为空')));
+		$form->addInput($user);
 
 		$pass = new Password(
 			'pass',
@@ -128,7 +128,7 @@ class Plugin implements PluginInterface
 			NULL,
 			_t('SMTP密码')
 		);
-		$form->addInput($pass->addRule('required', _t('SMTP服务验证密码不能为空')));
+		$form->addInput($pass);
 
 		$validate = new Checkbox(
 			'validate',
@@ -142,6 +142,33 @@ class Plugin implements PluginInterface
 			'SMTP验证'
 		);
 		$form->addInput($validate);
+
+		$resendApiKey = new Password(
+			'resendApiKey',
+			NULL,
+			NULL,
+			_t('Resend API Key'),
+			_t('发信方式选择 Resend API 时填写, 例如 re_xxxxxxxxx。')
+		);
+		$form->addInput($resendApiKey);
+
+		$resendFrom = new Text(
+			'resendFrom',
+			NULL,
+			NULL,
+			_t('Resend 发件邮箱'),
+			_t('必须是 Resend 已验证域名下的邮箱地址, 例如 no-reply@example.com。发件人名称使用下方“发件人名称”。')
+		);
+		$form->addInput($resendFrom->addRule('email', _t('请填写正确的 Resend 发件邮箱!')));
+
+		$resendApiUrl = new Text(
+			'resendApiUrl',
+			NULL,
+			'https://api.resend.com/emails',
+			_t('Resend API 地址'),
+			_t('默认即可。如需代理或自建网关, 请填写完整 HTTPS 地址。')
+		);
+		$form->addInput($resendApiUrl);
 
 		$fromName = new Text(
 			'fromName',
@@ -185,6 +212,28 @@ class Plugin implements PluginInterface
 			_t('访客接收邮件标题')
 		);
 		$form->addInput($titleForGuest->addRule('required', _t('访客接收邮件标题 不能为空')));
+
+		$templateHelp = _t('支持变量: {{siteTitle}}, {{title}}, {{author}}, {{author_p}}, {{ip}}, {{mail}}, {{permalink}}, {{manage}}, {{text}}, {{text_p}}, {{contactme}}, {{time}}, {{status}}。留空时使用插件 template 目录中的默认模板。');
+
+		$ownerTemplate = new Textarea(
+			'ownerTemplate',
+			null,
+			self::defaultTemplate('owner'),
+			_t('博主通知邮件模板'),
+			$templateHelp
+		);
+		$ownerTemplate->input->setAttribute('class', 'w-100 mono');
+		$form->addInput($ownerTemplate);
+
+		$guestTemplate = new Textarea(
+			'guestTemplate',
+			null,
+			self::defaultTemplate('guest'),
+			_t('访客回复通知邮件模板'),
+			$templateHelp
+		);
+		$guestTemplate->input->setAttribute('class', 'w-100 mono');
+		$form->addInput($guestTemplate);
 
 		$status = new Checkbox(
 			'status',
@@ -237,6 +286,12 @@ class Plugin implements PluginInterface
 	{
 	}
 
+	private static function defaultTemplate(string $name): string
+	{
+		$file = __DIR__ . '/template/' . $name . '.html';
+		return file_exists($file) ? file_get_contents($file) : '';
+	}
+
 	/**
 	 * 建立 邮件队列 数据表
 	 */
@@ -244,17 +299,17 @@ class Plugin implements PluginInterface
 	{
 		$installDb = Db::get();
 
-        $adapter = explode('_', $installDb->getAdapterName());
+		$adapter = explode('_', $installDb->getAdapterName());
 		$adapter_typ = array_pop($adapter); //数据库类型 mysql/sqlite/postgres
-        if ($adapter_typ == "Mysqli") $type = "Mysql";
-        $supported_adapter = ["Mysql", "Pgsql", "SQLite"];
-        if (!in_array($adapter_typ, $supported_adapter)) {
+		$type = $adapter_typ === "Mysqli" ? "Mysql" : $adapter_typ;
+		$supported_adapter = ["Mysql", "Pgsql", "SQLite"];
+        if (!in_array($type, $supported_adapter)) {
             throw new \Typecho\Plugin\Exception('数据表建立失败, 不支持的数据库驱动, (仅支持 Mysql, SQLite, PgSQL)');
         }
 
 		$prefix = $installDb->getPrefix(); //表前缀
 
-		$scripts = file_get_contents(__DIR__ . '/sql/' . $adapter_typ . '.sql');
+		$scripts = file_get_contents(__DIR__ . '/sql/' . $type . '.sql');
 		$scripts = str_replace('typecho_', $prefix, $scripts);
 		$scripts = str_replace('%charset%', 'utf8', $scripts);
 		$scripts = explode(';', $scripts);
@@ -321,8 +376,10 @@ class Plugin implements PluginInterface
 		$deliverUrlSync = rtrim($entryUrlSync, '/') . '/action/' . self::$_action . '?do=deliverMail&key=' . $keySync;;
 		
 		$isSync = Helper::options()->plugin('CommentToMail')->other;
-		if (in_array('isSync', $isSync)){
-			file_get_contents($deliverUrlSync);
+		$isSync = is_array($isSync) ? $isSync : (empty($isSync) ? [] : [$isSync]);
+		if (in_array('isSync', $isSync, true)){
+			$context = stream_context_create(['http' => ['timeout' => 10]]);
+			file_get_contents($deliverUrlSync, false, $context);
 		}
 	}
 	

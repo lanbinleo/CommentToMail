@@ -47,9 +47,9 @@ class Console extends Widget
     {
         $this->widget('Widget_User')->pass('administrator');
         $files = glob($this->_template_dir . '*.html');
-        $this->_currentFile = $this->request->get('file', 'owner.html');
+        $this->_currentFile = basename((string)$this->request->get('file', 'owner.html'));
 
-        if (preg_match("/^([_0-9a-z-\.\ ])+$/i", $this->_currentFile) && file_exists($this->_template_dir . $this->_currentFile)) {
+        if (preg_match('/^[A-Za-z0-9_.-]+\.html$/', $this->_currentFile) && file_exists($this->_template_dir . $this->_currentFile)) {
             foreach ($files as $file) {
                 if (!file_exists($file)) continue;
                 $file = basename($file);
@@ -80,15 +80,15 @@ class Console extends Widget
      */
     public function currentContent(): string
     {
-        return htmlspecialchars(file_get_contents($this->_template_dir . $this->_currentFile));
+        return htmlspecialchars(file_get_contents($this->_template_dir . $this->_currentFile), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
     }
 
     /**
      * 获取文件是否可读
      *
-     * @return string
+     * @return bool
      */
-    public function currentIsWriteable(): string
+    public function currentIsWriteable(): bool
     {
         return is_writeable($this->_template_dir . $this->_currentFile);
     }

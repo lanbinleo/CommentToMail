@@ -124,12 +124,12 @@ class Action extends Widget implements \Widget\ActionInterface
      * @param string $key
      * @return void
      */
-    private function deliverMail(string $key): void
+    private function deliverMail(?string $key): void
     {
-        if ($key != $this->_cfg->key) {
+        if (!hash_equals((string)$this->_cfg->key, (string)$key)) {
             $this->response->throwJson([
                 'code' => -1,
-                'msg' => 'Permission deniend'
+                'msg' => 'Permission denied'
             ]);
         }
 
@@ -139,10 +139,14 @@ class Action extends Widget implements \Widget\ActionInterface
         $success = 0;
         foreach ($mailQueue as &$mail) {
 
-            $this->_comment = unserialize(base64_decode($mail['content']));
+            $content = base64_decode($mail['content'], true);
+            $comment = $content === false ? false : unserialize($content, [
+                'allowed_classes' => ['TypechoPlugin\CommentToMail\lib\Comment']
+            ]);
 
             /** 发送邮件 */
-            if (!$this->_comment) continue;
+            if (!$comment instanceof \TypechoPlugin\CommentToMail\lib\Comment) continue;
+            $this->_comment = $comment;
 
             if ($this->processMail()) {
                 $this->_db->query($this->_db->update($this->_prefix . 'mail')->rows(['sent' => 1])->where('id = ?', $mail['id'])); //标识为已发送
@@ -176,30 +180,32 @@ class Action extends Widget implements \Widget\ActionInterface
         $this->_email = new Email();
 
         //发件人邮箱
-        $this->_email->from = $this->_cfg->user;
+        $this->_email->from = (string)(((string)$this->_cfg->mode === 'resend' && !empty($this->_cfg->resendFrom)) ? $this->_cfg->resendFrom : $this->_cfg->user);
         //发件人名称
-        $this->_email->fromName = $this->_cfg->fromName ? $this->_cfg->fromName : $this->_options->title;
+        $this->_email->fromName = (string)($this->_cfg->fromName ? $this->_cfg->fromName : $this->_options->title);
 
         //向博主发邮件的标题格式
-        $this->_email->titleForOwner = $this->_cfg->titleForOwner;
+        $this->_email->titleForOwner = (string)$this->_cfg->titleForOwner;
 
         //向访客发邮件的标题格式
-        $this->_email->titleForGuest = $this->_cfg->titleForGuest;
+        $this->_email->titleForGuest = (string)$this->_cfg->titleForGuest;
 
         //验证博主是否接收自己的邮件
-        $toMe = (in_array('to_me', $this->_cfg->other) && $this->_comment->ownerId == $this->_comment->authorId) ? true : false;
+        $toMe = ($this->cfgEnabled('other', 'to_me') && $this->_comment->ownerId == $this->_comment->authorId) ? true : false;
+        $sent = false;
+        $success = true;
 
         //向博主发信
         // TODO $this->_comment->parent === '0' // parent === ‘0’ 时 为根评论
         // 如果在此处判断 会导致 别人评论别人的评论时 不会发送邮件给博主 后续fix
-        if (in_array($this->_comment->status, $this->_cfg->status) && $this->_comment->type !== '1' && in_array('to_owner', $this->_cfg->other) && ($toMe || $this->_comment->ownerId != $this->_comment->authorId)) {
+        if (in_array($this->_comment->status, $this->cfgArray('status'), true) && $this->_comment->type !== '1' && $this->cfgEnabled('other', 'to_owner') && ($toMe || $this->_comment->ownerId != $this->_comment->authorId)) {
             if (!$this->_cfg->mail) {
                 self::widget('\Widget\Users\Author@temp' . $this->_comment->cid, ['uid' => $this->_comment->ownerId])->to($user);
                 $this->_email->reciver = $user->mail;
             } else {
                 $this->_email->reciver = $this->_cfg->mail;
             }
-            if (!$this->_cfg->name) {
+            if (empty($this->_cfg->name)) {
                 self::widget('\Widget\Users\Author@temp' . $this->_comment->cid, ['uid' => $this->_comment->ownerId])->to($user);
                 $this->_email->reciverName = $user->name;
             } else {
@@ -209,11 +215,13 @@ class Action extends Widget implements \Widget\ActionInterface
             // 设置邮件回复信息
             $this->_email->replyTo = $this->_comment->mail; //评论者的邮箱
             $this->_email->replyToName = $this->_comment->author;
-            $this->authorMail()->sendMail();
+            $result = $this->authorMail()->sendMail();
+            $sent = true;
+            $success = $success && $result === true;
         }
 
         /** 向访客发信 */
-        if ($this->_comment->parent !== '0' && $this->_comment->status == 'approved' && in_array('to_guest', $this->_cfg->other)) {
+        if ($this->_comment->parent !== '0' && $this->_comment->status == 'approved' && $this->cfgEnabled('other', 'to_guest')) {
             /**  如果联系我的邮件地址为空，则使用文章作者的邮件地址 */
             if (!$this->_cfg->contactme) {
                 if (!isset($user) || !$user) {
@@ -226,7 +234,7 @@ class Action extends Widget implements \Widget\ActionInterface
 
             $original = $this->_db->fetchRow($this->_db->select('author', 'mail', 'text')->from('table.comments')->where('coid = ?', $this->_comment->parent));
             // 被评论者
-            if (in_array('to_me', $this->_cfg->other) || $this->_comment->mail != $original['mail']) {
+            if ($original && ($this->cfgEnabled('other', 'to_me') || $this->_comment->mail != $original['mail'])) {
                 $this->_comment->originalText   = $original['text'];
                 $this->_comment->originalAuthor = $original['author'];
 
@@ -234,13 +242,15 @@ class Action extends Widget implements \Widget\ActionInterface
                 $this->_email->reciverName = $original['author'];
                 $this->_email->replyTo  = $this->_comment->mail; //当前评论者的邮箱
                 $this->_email->replyToName = $this->_comment->author ? $this->_comment->author : $this->_options->title;
-                $this->guestMail()->sendMail();
+                $result = $this->guestMail()->sendMail();
+                $sent = true;
+                $success = $success && $result === true;
             }
         }
 
         unset($this->_comment); //销毁评论对象
         unset($this->_email); //销毁对象
-        return true;
+        return $sent ? $success : true;
     }
 
     /**
@@ -331,6 +341,10 @@ class Action extends Widget implements \Widget\ActionInterface
     public function sendMail(): bool|string|NULL
     {
         /** 载入邮件组件 */
+        if ((string)$this->_cfg->mode === 'resend') {
+            return $this->sendByResend();
+        }
+
         $mailer = new PHPMailer();
         $mailer->CharSet = 'UTF-8';
         $mailer->Encoding = 'base64';
@@ -344,11 +358,11 @@ class Action extends Widget implements \Widget\ActionInterface
                 break;
             case 'smtp':
                 $mailer->IsSMTP();
-                if (in_array('validate', $this->_cfg->validate)) $mailer->SMTPAuth = true;
+                if ($this->cfgEnabled('validate', 'validate')) $mailer->SMTPAuth = true;
 
-                if (in_array('ssl', $this->_cfg->validate)) {
+                if ($this->cfgEnabled('validate', 'ssl')) {
                     $mailer->SMTPSecure = "ssl";
-                } else if (in_array('tls', $this->_cfg->validate)) {
+                } else if ($this->cfgEnabled('validate', 'tls')) {
                     $mailer->SMTPSecure = "tls";
                 }
 
@@ -363,11 +377,10 @@ class Action extends Widget implements \Widget\ActionInterface
         if (isset($this->_email->replyTo) && isset($this->_email->replyToName)) $mailer->AddReplyTo($this->_email->replyTo, $this->_email->replyToName);
         $mailer->Subject = $this->_email->subject;
         $mailer->AltBody = $this->_email->altBody;
-        if (in_array('solve544', $this->_cfg->validate)) $mailer->AddCC($this->_email->from); // 躲避审查造成的 544 错误 
+        if ($this->cfgEnabled('validate', 'solve544')) $mailer->AddCC($this->_email->from); // 躲避审查造成的 544 错误
 
         $mailer->MsgHTML($this->_email->msgHtml);
         $mailer->AddAddress($this->_email->reciver, $this->_email->reciverName);
-        $mailer->SMTPOptions = array('ssl' => array('verify_peer' => false, 'verify_peer_name' => false, 'allow_self_signed' => true));
 
         $result = $mailer->Send();
         if (!$result) $result = $mailer->ErrorInfo;
@@ -378,6 +391,99 @@ class Action extends Widget implements \Widget\ActionInterface
         return $result;
     }
 
+    private function sendByResend(): bool|string
+    {
+        $apiKey = trim((string)($this->_cfg->resendApiKey ?? ''));
+        $from = trim((string)($this->_cfg->resendFrom ?? $this->_email->from));
+        $endpoint = trim((string)($this->_cfg->resendApiUrl ?? ''));
+        $endpoint = $endpoint ?: 'https://api.resend.com/emails';
+
+        if ($apiKey === '') return 'Resend API Key 不能为空';
+        if ($from === '') return 'Resend 发件邮箱不能为空';
+        if (empty($this->_email->reciver)) return '收件人邮箱不能为空';
+        if (!filter_var($endpoint, FILTER_VALIDATE_URL)) return 'Resend API 地址格式不正确';
+        if (stripos($endpoint, 'https://') !== 0) return 'Resend API 地址必须使用 HTTPS';
+
+        $payload = [
+            'from' => $this->formatResendFrom($from, $this->_email->fromName),
+            'to' => [$this->_email->reciver],
+            'subject' => $this->_email->subject,
+            'html' => $this->_email->msgHtml,
+            'text' => $this->_email->altBody,
+        ];
+
+        if (!empty($this->_email->replyTo)) {
+            $payload['reply_to'] = [$this->_email->replyTo];
+        }
+
+        $body = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if ($body === false) return 'Resend 请求内容编码失败';
+
+        if (function_exists('curl_init')) {
+            $ch = curl_init($endpoint);
+            curl_setopt_array($ch, [
+                CURLOPT_POST => true,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_CONNECTTIMEOUT => 10,
+                CURLOPT_TIMEOUT => 30,
+                CURLOPT_HTTPHEADER => [
+                    'Authorization: Bearer ' . $apiKey,
+                    'Content-Type: application/json',
+                ],
+                CURLOPT_POSTFIELDS => $body,
+            ]);
+
+            $response = curl_exec($ch);
+            $errno = curl_errno($ch);
+            $error = curl_error($ch);
+            $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+
+            if ($errno) return 'Resend 请求失败: ' . $error;
+        } else {
+            $context = stream_context_create([
+                'http' => [
+                    'method' => 'POST',
+                    'header' => implode("\r\n", [
+                        'Authorization: Bearer ' . $apiKey,
+                        'Content-Type: application/json',
+                    ]),
+                    'content' => $body,
+                    'timeout' => 30,
+                    'ignore_errors' => true,
+                ],
+            ]);
+            $response = file_get_contents($endpoint, false, $context);
+            $status = $this->httpStatusFromHeaders($http_response_header ?? []);
+        }
+
+        if ($status >= 200 && $status < 300) {
+            return true;
+        }
+
+        return 'Resend 返回错误(' . $status . '): ' . (string)$response;
+    }
+
+    private function formatResendFrom(string $email, string $name = ''): string
+    {
+        $email = trim($email);
+        $name = trim($name);
+        if ($name === '') return $email;
+
+        $name = str_replace(['"', "\r", "\n"], ['', '', ''], $name);
+        return $name . ' <' . $email . '>';
+    }
+
+    private function httpStatusFromHeaders(array $headers): int
+    {
+        foreach ($headers as $header) {
+            if (preg_match('/^HTTP\/\S+\s+(\d+)/', $header, $matches)) {
+                return (int)$matches[1];
+            }
+        }
+        return 0;
+    }
+
     /**
      * 获取邮件模板
      * 
@@ -386,6 +492,11 @@ class Action extends Widget implements \Widget\ActionInterface
      */
     public function getTemplate(string $template = 'owner'): string
     {
+        $cfgKey = $template . 'Template';
+        if (!empty($this->_cfg->{$cfgKey})) {
+            return (string)$this->_cfg->{$cfgKey};
+        }
+
         $filename = $this->_template_dir  . $template . '.html';
 
         if (!file_exists($filename)) {
@@ -408,8 +519,8 @@ class Action extends Widget implements \Widget\ActionInterface
 
         $this->_email = new Email();
 
-        $this->_email->from = $this->_cfg->user;
-        $this->_email->fromName = $this->_cfg->fromName ? $this->_cfg->fromName : $this->_options->title;
+        $this->_email->from = (string)(((string)$this->_cfg->mode === 'resend' && !empty($this->_cfg->resendFrom)) ? $this->_cfg->resendFrom : $this->_cfg->user);
+        $this->_email->fromName = (string)($this->_cfg->fromName ? $this->_cfg->fromName : $this->_options->title);
         $this->_email->reciver = $email['to'] ? $email['to'] : $this->_user->mail;
         $this->_email->reciverName = $email['toName'] ? $email['toName'] : $this->_user->screenName;
         $this->_email->subject = $email['title'];
@@ -420,8 +531,8 @@ class Action extends Widget implements \Widget\ActionInterface
 
         /** 提示信息 */
         $this->widget('\Widget\Notice')->set(
-            $result ? _t('邮件发送成功') : _t('邮件发送失败: ' . $result),
-            $result ? 'success' : 'notice'
+            $result === true ? _t('邮件发送成功') : _t('邮件发送失败: ' . $result),
+            $result === true ? 'success' : 'notice'
         );
 
         /** 转向原页 */
@@ -435,12 +546,10 @@ class Action extends Widget implements \Widget\ActionInterface
      */
     public function editTheme($file)
     {
-        $path = $this->_template_dir . $file;
+        $path = $this->templatePath($file);
 
-        if (file_exists($path) && is_writeable($path)) {
-            $handle = fopen($path, 'wb');
-            if ($handle && fwrite($handle, $this->request->content)) {
-                fclose($handle);
+        if ($path && is_writeable($path)) {
+            if (file_put_contents($path, (string)$this->request->content, LOCK_EX) !== false) {
                 $this->widget('Widget_Notice')->set(_t("文件 %s 的更改已经保存", $file), 'success');
             } else {
                 $this->widget('Widget_Notice')->set(_t("文件 %s 无法被写入", $file), 'error');
@@ -449,5 +558,34 @@ class Action extends Widget implements \Widget\ActionInterface
         } else {
             throw new \Typecho\Widget\Exception(_t('您编辑的模板文件不存在'));
         }
+    }
+
+    private function templatePath($file): ?string
+    {
+        $file = basename((string)$file);
+        if (!preg_match('/^[A-Za-z0-9_.-]+\.html$/', $file)) {
+            return null;
+        }
+
+        $path = realpath($this->_template_dir . $file);
+        $dir = realpath($this->_template_dir);
+        if ($path === false || $dir === false || strpos($path, $dir . DIRECTORY_SEPARATOR) !== 0) {
+            return null;
+        }
+
+        return $path;
+    }
+
+    private function cfgArray(string $key): array
+    {
+        if (empty($this->_cfg->{$key})) {
+            return [];
+        }
+        return is_array($this->_cfg->{$key}) ? $this->_cfg->{$key} : [$this->_cfg->{$key}];
+    }
+
+    private function cfgEnabled(string $key, string $value): bool
+    {
+        return in_array($value, $this->cfgArray($key), true);
     }
 }

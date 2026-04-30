@@ -16,13 +16,13 @@ use \Typecho\Widget;
 use \TypechoPlugin\CommentToMail\Plugin;
 
 $current = $request->get('act', 'index');
-$theme = $request->get('file', 'owner.html');
+$theme = basename((string)$request->get('file', 'owner.html'));
 $title = $current == 'index' ? $menu->title : '编辑邮件模板 ' . $theme;
 ?>
 <div class="main">
     <div class="body container">
         <div class="typecho-page-title">
-            <h2><?= $title ?></h2>
+            <h2><?= htmlspecialchars($title, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') ?></h2>
         </div>
         <div class="row typecho-page-main" role="main">
             <!-- MENU -->
@@ -61,7 +61,7 @@ $title = $current == 'index' ? $menu->title : '编辑邮件模板 ' . $theme;
                             <p class="submit">
                                 <?php if ($files->currentIsWriteable()) : ?>
                                     <input type="hidden" name="do" value="editTheme" />
-                                    <input type="hidden" name="edit" value="<?php echo $files->currentFile(); ?>" />
+                                    <input type="hidden" name="edit" value="<?php echo htmlspecialchars($files->currentFile(), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>" />
                                     <button type="submit" class="btn primary"><?php _e('保存文件'); ?></button>
                                 <?php else : ?>
                                     <em><?php _e('文件无写入权限'); ?></em>
@@ -73,7 +73,7 @@ $title = $current == 'index' ? $menu->title : '编辑邮件模板 ' . $theme;
                         <li><strong>模板文件</strong></li>
                         <?php while ($files->next()) : ?>
                             <li <?php if ($files->current) echo "class='current'"; ?>>
-                                <a href="<?php $options->adminUrl('extending.php?panel=' . Plugin::$_panel . '&act=theme' . '&file=' . $files->file); ?>">
+                                <a href="<?php $options->adminUrl('extending.php?panel=' . Plugin::$_panel . '&act=theme' . '&file=' . rawurlencode($files->file)); ?>">
                                     <?php $files->file(); ?>
                                 </a>
                             </li>
