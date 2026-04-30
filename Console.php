@@ -3,8 +3,10 @@
 namespace TypechoPlugin\CommentToMail;
 
 use \Typecho\{Widget};
+use \Typecho\Db;
 use \Typecho\Widget\Helper\Form;
 use \Typecho\Widget\Helper\Form\Element\{Text, Hidden, Submit, Textarea};
+use \TypechoPlugin\CommentToMail\lib\Comment;
 
 /**
  * CommentToMail
@@ -101,6 +103,99 @@ class Console extends Widget
     public function currentFile(): string
     {
         return $this->_currentFile;
+    }
+
+    public function queueStats(): array
+    {
+        Plugin::ensureQueueTable();
+
+        $db = Db::get();
+        $prefix = $db->getPrefix();
+        $stats = [
+            0 => 0,
+            1 => 0,
+            2 => 0,
+        ];
+
+        $rows = $db->fetchAll("SELECT sent, COUNT(*) AS total FROM {$prefix}mail GROUP BY sent");
+        foreach ($rows as $row) {
+            $stats[(int)$row['sent']] = (int)$row['total'];
+        }
+
+        return $stats;
+    }
+
+    public function queueRows(int $limit = 50): array
+    {
+        Plugin::ensureQueueTable();
+
+        $db = Db::get();
+        $prefix = $db->getPrefix();
+        $limit = max(1, min(100, $limit));
+        $rows = $db->fetchAll("SELECT id, content, sent, created, updated, attempts, last_error, next_retry FROM {$prefix}mail ORDER BY id DESC LIMIT {$limit}");
+
+        foreach ($rows as &$row) {
+            $comment = $this->decodeComment((string)$row['content']);
+            $row['summary'] = $comment ? [
+                'author' => $comment->author,
+                'mail' => $comment->mail,
+                'title' => $comment->title,
+                'permalink' => $comment->permalink,
+            ] : [
+                'author' => '',
+                'mail' => '',
+                'title' => '队列内容无法解析',
+                'permalink' => '',
+            ];
+        }
+
+        return $rows;
+    }
+
+    public function statusLabel(int $status): string
+    {
+        return [
+            0 => '待发送',
+            1 => '已发送',
+            2 => '失败',
+        ][$status] ?? '未知';
+    }
+
+    public function formatTime($timestamp): string
+    {
+        $timestamp = (int)$timestamp;
+        return $timestamp > 0 ? date('Y-m-d H:i:s', $timestamp) : '-';
+    }
+
+    private function decodeComment(string $payload): ?Comment
+    {
+        $content = base64_decode($payload, true);
+        if ($content === false) return null;
+
+        $comment = @unserialize($content, [
+            'allowed_classes' => [Comment::class, 'stdClass']
+        ]);
+
+        if ($comment instanceof Comment) return $comment;
+        if (!is_object($comment)) return null;
+
+        $hydrated = new Comment();
+        $hydrated->cid = (int)($comment->cid ?? 0);
+        $hydrated->coid = (int)($comment->coid ?? 0);
+        $hydrated->created = (int)($comment->created ?? time());
+        $hydrated->author = (string)($comment->author ?? '');
+        $hydrated->authorId = (int)($comment->authorId ?? 0);
+        $hydrated->ownerId = (int)($comment->ownerId ?? 0);
+        $hydrated->mail = (string)($comment->mail ?? '');
+        $hydrated->ip = (string)($comment->ip ?? '');
+        $hydrated->title = (string)($comment->title ?? '');
+        $hydrated->text = (string)($comment->text ?? '');
+        $hydrated->permalink = (string)($comment->permalink ?? '');
+        $hydrated->status = (string)($comment->status ?? 'approved');
+        $hydrated->parent = (string)($comment->parent ?? '0');
+        $hydrated->type = (string)($comment->type ?? '2');
+
+        return $hydrated;
     }
 
     /**

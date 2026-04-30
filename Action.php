@@ -13,6 +13,7 @@ namespace TypechoPlugin\CommentToMail;
 use \Utils\Helper;
 use \Typecho\{Widget, Db};
 use \TypechoPlugin\CommentToMail\lib\Email;
+use \TypechoPlugin\CommentToMail\lib\Comment;
 
 use PHPMailer\PHPMailer\PHPMailer;
 use PHPMailer\PHPMailer\Exception;
@@ -87,6 +88,13 @@ class Action extends Widget implements \Widget\ActionInterface
     private \TypechoPlugin\CommentToMail\lib\Comment $_comment;
 
     /**
+     * 最近一次发送错误
+     *
+     * @var string
+     */
+    private string $_lastMailError = '';
+
+    /**
      * 入口方法
      *
      * @access public
@@ -99,8 +107,12 @@ class Action extends Widget implements \Widget\ActionInterface
         $this->on($this->request->is('do=deliverMail'))->deliverMail($this->request->key);  //邮件队列
 
         if (!$this->_user->hasLogin()) $this->response->redirect($this->_options->loginUrl); //用户未登录
+        $this->_user->pass('administrator');
         $this->on($this->request->is('do=testMail'))->testMail();                           //测试邮件
         $this->on($this->request->is('do=editTheme'))->editTheme($this->request->edit);     //编辑主题
+        $this->on($this->request->is('do=runQueue'))->deliverMail(null, false, false);      //后台手动发送队列
+        $this->on($this->request->is('do=retryQueue'))->retryQueue();                       //重试失败队列
+        $this->on($this->request->is('do=clearLogs'))->clearLogs();                         //清理发送日志
     }
 
     /**
@@ -110,6 +122,8 @@ class Action extends Widget implements \Widget\ActionInterface
      */
     public function init()
     {
+        Plugin::ensureQueueTable();
+
         $this->_db = Db::get();
         $this->_prefix = $this->_db->getPrefix();
 
@@ -124,50 +138,69 @@ class Action extends Widget implements \Widget\ActionInterface
      * @param string $key
      * @return void
      */
-    private function deliverMail(?string $key): void
+    private function deliverMail(?string $key, bool $checkKey = true, bool $throwJson = true): void
     {
-        if (!hash_equals((string)$this->_cfg->key, (string)$key)) {
+        if ($checkKey && !hash_equals((string)$this->_cfg->key, (string)$key)) {
             $this->response->throwJson([
                 'code' => -1,
                 'msg' => 'Permission denied'
             ]);
         }
 
-        $mailQueue = $this->_db->fetchAll($this->_db->select('id', 'content')->from($this->_prefix . 'mail')->where('sent = ?', 0)); // 获取所有未发送的邮件
+        $now = time();
+        $limit = $this->queueLimit();
+        $table = $this->_prefix . 'mail';
+        $mailQueue = $this->_db->fetchAll("SELECT id, content, attempts FROM {$table} WHERE sent = 0 AND (next_retry IS NULL OR next_retry <= {$now}) AND (locked_until IS NULL OR locked_until <= {$now}) ORDER BY id ASC LIMIT {$limit}");
 
         //计数器
         $success = 0;
+        $fail = 0;
         foreach ($mailQueue as &$mail) {
+            if (!$this->claimQueueRow((int)$mail['id'])) {
+                continue;
+            }
 
-            $content = base64_decode($mail['content'], true);
-            $comment = $content === false ? false : unserialize($content, [
-                'allowed_classes' => ['TypechoPlugin\CommentToMail\lib\Comment']
-            ]);
+            $comment = $this->decodeQueuedComment($mail['content']);
 
             /** 发送邮件 */
-            if (!$comment instanceof \TypechoPlugin\CommentToMail\lib\Comment) continue;
+            if (!$comment instanceof Comment) {
+                $this->markQueueFailed((int)$mail['id'], (int)($mail['attempts'] ?? 0), '队列内容无法解析');
+                $fail++;
+                continue;
+            }
             $this->_comment = $comment;
 
             if ($this->processMail()) {
-                $this->_db->query($this->_db->update($this->_prefix . 'mail')->rows(['sent' => 1])->where('id = ?', $mail['id'])); //标识为已发送
+                $this->markQueueSent((int)$mail['id']);
                 $success++;
+            } else {
+                $this->markQueueFailed((int)$mail['id'], (int)($mail['attempts'] ?? 0), $this->_lastMailError ?: '邮件发送失败');
+                $fail++;
             }
 
             usleep(100); //休眠100毫秒 防止QPS限制
         }
-        //清除已发送的数据
-        $this->_db->query(
-            $this->_db->delete($this->_prefix . 'mail')->where('sent = ?', 1)
-        );
-        $this->response->throwJson([
+        $this->cleanupOldLogs();
+
+        $result = [
             'code' => 0,
             'msg' => 'success',
             'count' => [
                 'all' => count($mailQueue),
                 'success' => $success,
-                'fail' => count($mailQueue) - $success,
+                'fail' => $fail,
             ],
-        ]);
+        ];
+
+        if ($throwJson) {
+            $this->response->throwJson($result);
+        }
+
+        $this->widget('Widget_Notice')->set(
+            _t('队列处理完成: 共 %d, 成功 %d, 失败 %d', count($mailQueue), $success, $fail),
+            $fail > 0 ? 'notice' : 'success'
+        );
+        $this->response->goBack();
     }
 
     /**
@@ -194,6 +227,7 @@ class Action extends Widget implements \Widget\ActionInterface
         $toMe = ($this->cfgEnabled('other', 'to_me') && $this->_comment->ownerId == $this->_comment->authorId) ? true : false;
         $sent = false;
         $success = true;
+        $errors = [];
 
         //向博主发信
         // TODO $this->_comment->parent === '0' // parent === ‘0’ 时 为根评论
@@ -217,7 +251,10 @@ class Action extends Widget implements \Widget\ActionInterface
             $this->_email->replyToName = $this->_comment->author;
             $result = $this->authorMail()->sendMail();
             $sent = true;
-            $success = $success && $result === true;
+            if ($result !== true) {
+                $success = false;
+                $errors[] = (string)$result;
+            }
         }
 
         /** 向访客发信 */
@@ -244,10 +281,14 @@ class Action extends Widget implements \Widget\ActionInterface
                 $this->_email->replyToName = $this->_comment->author ? $this->_comment->author : $this->_options->title;
                 $result = $this->guestMail()->sendMail();
                 $sent = true;
-                $success = $success && $result === true;
+                if ($result !== true) {
+                    $success = false;
+                    $errors[] = (string)$result;
+                }
             }
         }
 
+        $this->_lastMailError = implode('; ', array_filter($errors));
         unset($this->_comment); //销毁评论对象
         unset($this->_email); //销毁对象
         return $sent ? $success : true;
@@ -482,6 +523,145 @@ class Action extends Widget implements \Widget\ActionInterface
             }
         }
         return 0;
+    }
+
+    private function decodeQueuedComment(string $payload): ?Comment
+    {
+        $content = base64_decode($payload, true);
+        if ($content === false) return null;
+
+        $comment = @unserialize($content, [
+            'allowed_classes' => [Comment::class, 'stdClass']
+        ]);
+
+        if ($comment instanceof Comment) {
+            return $comment;
+        }
+
+        if (is_object($comment)) {
+            return $this->hydrateLegacyComment($comment);
+        }
+
+        return null;
+    }
+
+    private function hydrateLegacyComment(object $legacy): Comment
+    {
+        $comment = new Comment();
+        $comment->cid = (int)($legacy->cid ?? 0);
+        $comment->coid = (int)($legacy->coid ?? 0);
+        $comment->created = (int)($legacy->created ?? time());
+        $comment->author = (string)($legacy->author ?? '');
+        $comment->authorId = (int)($legacy->authorId ?? 0);
+        $comment->ownerId = (int)($legacy->ownerId ?? 0);
+        $comment->mail = (string)($legacy->mail ?? '');
+        $comment->ip = (string)($legacy->ip ?? '');
+        $comment->title = (string)($legacy->title ?? '');
+        $comment->text = (string)($legacy->text ?? '');
+        $comment->permalink = (string)($legacy->permalink ?? '');
+        $comment->status = (string)($legacy->status ?? 'approved');
+        $comment->parent = (string)($legacy->parent ?? '0');
+        $comment->type = (string)($legacy->type ?? '2');
+
+        return $comment;
+    }
+
+    private function markQueueSent(int $id): void
+    {
+        $this->_db->query($this->_db->update($this->_prefix . 'mail')->rows([
+            'sent' => 1,
+            'updated' => time(),
+            'last_error' => '',
+            'next_retry' => 0,
+            'locked_until' => 0,
+        ])->where('id = ?', $id));
+    }
+
+    private function markQueueFailed(int $id, int $attempts, string $error): void
+    {
+        $attempts++;
+        $maxAttempts = $this->maxAttempts();
+        $failed = $attempts >= $maxAttempts;
+        $backoff = min(3600, 60 * (2 ** max(0, $attempts - 1)));
+
+        $this->_db->query($this->_db->update($this->_prefix . 'mail')->rows([
+            'sent' => $failed ? 2 : 0,
+            'updated' => time(),
+            'attempts' => $attempts,
+            'last_error' => $this->shortText($error, 2000),
+            'next_retry' => $failed ? 0 : time() + $backoff,
+            'locked_until' => 0,
+        ])->where('id = ?', $id));
+    }
+
+    private function claimQueueRow(int $id): bool
+    {
+        $now = time();
+        $lockedUntil = $now + 300;
+        $affected = $this->_db->query($this->_db->update($this->_prefix . 'mail')->rows([
+            'locked_until' => $lockedUntil,
+        ])->where('id = ? AND sent = ? AND (locked_until IS NULL OR locked_until <= ?)', $id, 0, $now));
+
+        return (int)$affected > 0;
+    }
+
+    private function cleanupOldLogs(): void
+    {
+        $days = (int)($this->_cfg->logKeepDays ?? 30);
+        if ($days < 1) return;
+
+        $before = time() - ($days * 86400);
+        $this->_db->query($this->_db->delete($this->_prefix . 'mail')->where('sent = ? AND updated > ? AND updated < ?', 1, 0, $before));
+    }
+
+    private function retryQueue(): void
+    {
+        $id = (int)$this->request->get('id', 0);
+        $rows = [
+            'sent' => 0,
+            'updated' => time(),
+            'attempts' => 0,
+            'last_error' => '',
+            'next_retry' => 0,
+            'locked_until' => 0,
+        ];
+
+        $query = $this->_db->update($this->_prefix . 'mail')->rows($rows)->where('sent = ?', 2);
+        if ($id > 0) {
+            $query->where('id = ?', $id);
+        }
+
+        $this->_db->query($query);
+        $this->widget('Widget_Notice')->set(_t('失败队列已重新加入待发送列表'), 'success');
+        $this->response->goBack();
+    }
+
+    private function clearLogs(): void
+    {
+        $this->_db->query($this->_db->delete($this->_prefix . 'mail')->where('sent <> ?', 0));
+        $this->widget('Widget_Notice')->set(_t('发送日志已清理'), 'success');
+        $this->response->goBack();
+    }
+
+    private function queueLimit(): int
+    {
+        $limit = (int)($this->_cfg->batchSize ?? 10);
+        return max(1, min(100, $limit));
+    }
+
+    private function maxAttempts(): int
+    {
+        $attempts = (int)($this->_cfg->maxAttempts ?? 5);
+        return max(1, min(20, $attempts));
+    }
+
+    private function shortText(string $text, int $max): string
+    {
+        if (function_exists('mb_substr')) {
+            return mb_substr($text, 0, $max, 'UTF-8');
+        }
+
+        return substr($text, 0, $max);
     }
 
     /**

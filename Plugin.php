@@ -40,6 +40,8 @@ class Plugin implements PluginInterface
 	 */
 	public static $_panel  = 'CommentToMail/page/console.php';
 
+	private static bool $_queueTableReady = false;
+
 	/**
 	 * 激活插件方法,如果激活失败,直接抛出异常
 	 *
@@ -254,13 +256,43 @@ class Plugin implements PluginInterface
 				'to_owner' => '有评论及回复时, 发邮件通知博主.',
 				'to_guest' => '评论被回复时, 发邮件通知评论者.',
 				'to_me' => '自己回复自己的评论时, 发邮件通知. (同时针对博主和访客)',
-				'isSync' => '同步发送邮件，否则需要手动（或者用定时任务自动）执行发送任务',
+				'isSync' => '评论提交后异步触发发送队列',
 			],
 			['to_owner', 'to_guest'],
 			'其他设置',
 			NULL
 		);
 		$form->addInput($other->multiMode());
+
+		$batchSize = new Text(
+			'batchSize',
+			null,
+			'10',
+			_t('每次发送队列数量'),
+			_t('异步触发或定时任务每次最多处理多少封邮件。')
+		);
+		$batchSize->input->setAttribute('class', 'mini');
+		$form->addInput($batchSize->addRule('isInteger', _t('每次发送队列数量必须为数字')));
+
+		$maxAttempts = new Text(
+			'maxAttempts',
+			null,
+			'5',
+			_t('最大重试次数'),
+			_t('超过次数后任务标记为失败, 可在后台手动重试。')
+		);
+		$maxAttempts->input->setAttribute('class', 'mini');
+		$form->addInput($maxAttempts->addRule('isInteger', _t('最大重试次数必须为数字')));
+
+		$logKeepDays = new Text(
+			'logKeepDays',
+			null,
+			'30',
+			_t('日志保留天数'),
+			_t('成功发送记录会保留指定天数, 失败记录会一直保留到手动清理或重试成功。')
+		);
+		$logKeepDays->input->setAttribute('class', 'mini');
+		$form->addInput($logKeepDays->addRule('isInteger', _t('日志保留天数必须为数字')));
 
 
 		$entryUrl = ($options->rewrite) ? $options->siteUrl : $options->siteUrl . 'index.php'; // 博客网址
@@ -292,11 +324,69 @@ class Plugin implements PluginInterface
 		return file_exists($file) ? file_get_contents($file) : '';
 	}
 
+	public static function ensureQueueTable(): void
+	{
+		if (self::$_queueTableReady) return;
+
+		self::dbInstall();
+		self::$_queueTableReady = true;
+	}
+
+	private static function migrateQueueTable(Db $db, string $prefix, string $type): void
+	{
+		$table = $prefix . 'mail';
+		$columns = [
+			'created' => [
+				'Mysql' => "int(10) unsigned DEFAULT '0'",
+				'SQLite' => 'int(10) default 0',
+				'Pgsql' => 'int DEFAULT 0',
+			],
+			'updated' => [
+				'Mysql' => "int(10) unsigned DEFAULT '0'",
+				'SQLite' => 'int(10) default 0',
+				'Pgsql' => 'int DEFAULT 0',
+			],
+			'attempts' => [
+				'Mysql' => "int(10) unsigned DEFAULT '0'",
+				'SQLite' => 'int(10) default 0',
+				'Pgsql' => 'int DEFAULT 0',
+			],
+			'last_error' => [
+				'Mysql' => 'text NULL',
+				'SQLite' => 'text NULL',
+				'Pgsql' => 'text NULL',
+			],
+			'next_retry' => [
+				'Mysql' => "int(10) unsigned DEFAULT '0'",
+				'SQLite' => 'int(10) default 0',
+				'Pgsql' => 'int DEFAULT 0',
+			],
+			'locked_until' => [
+				'Mysql' => "int(10) unsigned DEFAULT '0'",
+				'SQLite' => 'int(10) default 0',
+				'Pgsql' => 'int DEFAULT 0',
+			],
+		];
+
+		foreach ($columns as $column => $definitions) {
+			try {
+				$db->query("SELECT {$column} FROM {$table} LIMIT 1", Db::READ);
+			} catch (\Typecho\Db\Exception $e) {
+				$db->query("ALTER TABLE {$table} ADD COLUMN {$column} {$definitions[$type]}", Db::WRITE);
+			}
+		}
+
+		$now = time();
+		$db->query("UPDATE {$table} SET created = {$now} WHERE created IS NULL OR created = 0", Db::WRITE);
+		$db->query("UPDATE {$table} SET updated = created WHERE updated IS NULL OR updated = 0", Db::WRITE);
+	}
+
 	/**
 	 * 建立 邮件队列 数据表
 	 */
 	public static function dbInstall()
 	{
+		self::$_queueTableReady = false;
 		$installDb = Db::get();
 
 		$adapter = explode('_', $installDb->getAdapterName());
@@ -318,14 +408,18 @@ class Plugin implements PluginInterface
 				$script = trim($script);
 				if ($script) $installDb->query($script, Db::WRITE);
 			}
-			return '建立邮件队列数据表成功, 请继续设置SMTP信息';
+			self::migrateQueueTable($installDb, $prefix, $type);
+			self::$_queueTableReady = true;
+			return '邮件队列表已准备完成, 请继续设置发信信息';
 		} catch (\Typecho\Db\Exception $e) {
 			$code = $e->getCode();
 			if (($type === 'Mysql' && $code === 1050) || ($type === 'SQLite' && ($code === 'HY000' || $code === 1))) {
 				try {
-					$script = "SELECT `id`, `content`, `sent` FROM `{$prefix}mail`";
+					$script = "SELECT id, content, sent FROM {$prefix}mail";
 					$installDb->query($script, Db::READ);
-					return '检测到邮件队列数据表存在, 请继续设置SMTP信息';
+					self::migrateQueueTable($installDb, $prefix, $type);
+					self::$_queueTableReady = true;
+					return '检测到旧版邮件队列表, 已完成兼容迁移';
 				} catch (\Typecho\Db\Exception $e) {
 					throw new \Typecho\Plugin\Exception('数据表检测失败, 插件启用失败。错误代码:' . $code);
 				}
@@ -343,6 +437,8 @@ class Plugin implements PluginInterface
 	 */
 	public static function parseComment($comment)
 	{
+		self::ensureQueueTable();
+
 		$commentClass = new \TypechoPlugin\CommentToMail\lib\Comment;
 
 		$commentClass->cid = $comment->cid;
@@ -364,23 +460,47 @@ class Plugin implements PluginInterface
 		$db = Db::get();
 		$db->query(
 			$db->insert($db->getPrefix() . 'mail')->rows([
-				'content' => base64_encode(serialize((object)$commentClass)),
-				'sent' => '0'
+				'content' => base64_encode(serialize($commentClass)),
+				'sent' => '0',
+				'created' => time(),
+				'updated' => time(),
+				'attempts' => 0,
+				'last_error' => '',
+				'next_retry' => 0,
+				'locked_until' => 0,
 			])
 		);
 
 		// 如果同步就直接发邮件，否则添加至队列
-		$keySync = Helper::options()->plugin('CommentToMail')->key;		
+		$keySync = Helper::options()->plugin('CommentToMail')->key;
 		$optionsSync = Widget::widget('Widget_Options');
 		$entryUrlSync = ($optionsSync->rewrite) ? $optionsSync->siteUrl : $optionsSync->siteUrl . 'index.php'; // 博客网址
-		$deliverUrlSync = rtrim($entryUrlSync, '/') . '/action/' . self::$_action . '?do=deliverMail&key=' . $keySync;;
-		
+		$deliverUrlSync = rtrim($entryUrlSync, '/') . '/action/' . self::$_action . '?do=deliverMail&key=' . rawurlencode($keySync);;
+
 		$isSync = Helper::options()->plugin('CommentToMail')->other;
 		$isSync = is_array($isSync) ? $isSync : (empty($isSync) ? [] : [$isSync]);
 		if (in_array('isSync', $isSync, true)){
-			$context = stream_context_create(['http' => ['timeout' => 10]]);
-			file_get_contents($deliverUrlSync, false, $context);
+			self::triggerQueueAsync($deliverUrlSync);
 		}
+	}
+
+	private static function triggerQueueAsync(string $url): void
+	{
+		$parts = parse_url($url);
+		if (empty($parts['host']) || empty($parts['scheme'])) return;
+
+		$scheme = strtolower($parts['scheme']);
+		$host = $parts['host'];
+		$port = $parts['port'] ?? ($scheme === 'https' ? 443 : 80);
+		$target = ($parts['path'] ?? '/') . (isset($parts['query']) ? '?' . $parts['query'] : '');
+		$transport = $scheme === 'https' ? 'ssl://' . $host : $host;
+
+		$socket = @stream_socket_client($transport . ':' . $port, $errno, $errstr, 1, STREAM_CLIENT_CONNECT);
+		if (!$socket) return;
+
+		stream_set_blocking($socket, false);
+		fwrite($socket, "GET {$target} HTTP/1.1\r\nHost: {$host}\r\nConnection: Close\r\n\r\n");
+		fclose($socket);
 	}
 	
 	/**
